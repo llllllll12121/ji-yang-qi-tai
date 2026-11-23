@@ -6388,6 +6388,107 @@ window.__JYQT_STORY_OK = (function(){
     MAX_GAME_SCORE: 999999,
     RENAME_COOLDOWN_MS: 10000
   };
+
+/* v36: 联网风云榜（Supabase）——插入排行榜 IIFE 内 CFG 之后。
+   设计：
+   - 成绩结算时：本地照常记分（applyLocal），同时把成绩 POST 到 Supabase
+     （先查该 player_id 的已有最佳分，只有新分更高才 upsert；失败静默，不阻塞游戏）。
+   - 打开榜单时：先同步渲染本地榜（立即有内容），再异步拉取联网榜覆盖；
+     拉取失败（离线/超时/报错）则保留本地榜，并明确标注“本地模拟”。
+   - 云端只用 Publishable/anon key（公开 key，专用于前端）；绝不放服务端密钥。
+   - 防刷分说明：本榜为休闲榜，仅做“只记更好分 + 昵称清洗 + 频率由结算流程天然限制”；
+     不宣称有服务端反作弊。 */
+var CLOUD = {
+  url: "https://mvbcsgycxqrcbfsfcskt.supabase.co",
+  anonKey: "sb_publishable_F3QfXz3WV3eXx93b8_j2Eg_9EIGuZe5",
+  table: "leaderboard_scores",
+  timeoutMs: 5000
+};
+var cloudCache = null; /* { entries:[...], at:timestamp }，联网拉取成功后缓存，供榜单与“我的”页共用 */
+function cloudHeaders(){
+  return { "apikey": CLOUD.anonKey, "Authorization": "Bearer " + CLOUD.anonKey, "Content-Type": "application/json" };
+}
+function cloudFetchWithTimeout(url, opts, ms){
+  return new Promise(function(resolve, reject){
+    var done = false;
+    var timer = setTimeout(function(){ if(!done){ done = true; reject(new Error("timeout")); } }, ms || CLOUD.timeoutMs);
+    fetch(url, opts).then(function(res){
+      if(done) return; done = true; clearTimeout(timer); resolve(res);
+    }).catch(function(err){
+      if(done) return; done = true; clearTimeout(timer); reject(err);
+    });
+  });
+}
+function avatarFor(id){
+  var h = 0, s = String(id || "");
+  for(var i = 0; i < s.length; i++){ h = (h * 31 + s.charCodeAt(i)) >>> 0; }
+  return h % 6;
+}
+function cloudToEntry(row){
+  return {
+    player_id: row.player_id || ("cloud-" + row.nickname),
+    nickname: row.nickname,
+    avatar: avatarFor(row.player_id || row.nickname),
+    best_ranking_score: Number(row.score) || 0,
+    best_game_score: Number(row.game_score) || 0,
+    collection_count: Number(row.collection) || 0,
+    is_completed: !!row.completed,
+    achieved_at: row.created_at || ""
+  };
+}
+function cloudFetch(){
+  /* 取前 100 条再按 player_id 去重（每人只留最高分），取前 50。
+     不用 upsert：anon 只有 SELECT/INSERT 权限（无 UPDATE），upsert 需要 UPDATE；
+     给 anon 开 UPDATE 会让任何人能改别人的分，所以改用“只插更好分 + 客户端去重”。 */
+  var url = CLOUD.url + "/rest/v1/" + CLOUD.table + "?select=player_id,nickname,score,game_score,collection,completed,created_at&order=score.desc&limit=100";
+  return cloudFetchWithTimeout(url, { method: "GET", headers: cloudHeaders() }).then(function(res){
+    if(!res.ok) return null;
+    return res.json();
+  }).then(function(rows){
+    if(!Array.isArray(rows)) return null;
+    var seen = {}, entries = [];
+    rows.forEach(function(row){
+      var pid = row.player_id || ("cloud-" + row.nickname);
+      if(seen[pid]) return;
+      seen[pid] = true;
+      entries.push(cloudToEntry(row));
+    });
+    entries.sort(function(a, b){
+      if(b.best_ranking_score !== a.best_ranking_score) return b.best_ranking_score - a.best_ranking_score;
+      if(b.best_game_score !== a.best_game_score) return b.best_game_score - a.best_game_score;
+      return String(a.achieved_at || "").localeCompare(String(b.achieved_at || ""));
+    });
+    return entries.slice(0, 50);
+  }).catch(function(){ return null; });
+}
+function cloudSubmit(rec, ranking){
+  var pid = rec.player_id;
+  /* 只插更好分：先查该玩家现有最高分，新分不高就不插，避免表里堆满低分行 */
+  var getUrl = CLOUD.url + "/rest/v1/" + CLOUD.table + "?select=score&player_id=eq." + encodeURIComponent(pid) + "&order=score.desc&limit=1";
+  return cloudFetchWithTimeout(getUrl, { method: "GET", headers: cloudHeaders() }).then(function(res){
+    if(!res.ok) return null;
+    return res.json();
+  }).then(function(rows){
+    var existing = (rows && rows[0]) ? Number(rows[0].score) : null;
+    if(existing !== null && ranking <= existing) return { skipped: true };
+    var body = {
+      player_id: pid, nickname: rec.nickname, score: ranking,
+      game_score: rec.game_score, collection: rec.collection_count,
+      completed: rec.is_completed
+    };
+    var postUrl = CLOUD.url + "/rest/v1/" + CLOUD.table;
+    return cloudFetchWithTimeout(postUrl, {
+      method: "POST",
+      headers: { "apikey": CLOUD.anonKey, "Authorization": "Bearer " + CLOUD.anonKey, "Content-Type": "application/json", "Prefer": "return=representation" },
+      body: JSON.stringify(body)
+    }).then(function(res){ return res.ok ? { submitted: true } : null; });
+  }).catch(function(){ return null; });
+}
+function currentEntries(){
+  if(cloudCache && cloudCache.entries) return cloudCache.entries;
+  return localEntries();
+}
+
   var TITLES = [
     { id:"first",    name:"初入博物馆", test:function(m){ return m.historyCount >= 1; } },
     { id:"treasure", name:"寻宝小能手", test:function(m){ return m.bestRanking >= 40; } },
@@ -6534,13 +6635,28 @@ window.__JYQT_STORY_OK = (function(){
   function submitScore(rec){
     var ranking = computeRanking(rec.game_score, rec.collection_count, rec.completed_levels, rec.is_completed);
     if(seenChallenges[rec.challenge_id]){
-      var entries0 = localEntries(), rank0 = null;
+      var entries0 = currentEntries(), rank0 = null;
       entries0.forEach(function(e, i){ if(e.player_id === rec.player_id) rank0 = i + 1; });
       return Promise.resolve({ ranking_score: ranking, rank: rank0, total_players: entries0.length, is_new_best: false, source: "board" });
     }
     seenChallenges[rec.challenge_id] = true;
     var r = applyLocal(rec, ranking);
     r.source = "board";
+    /* v36: 联网提交（不阻塞结算面板；成功后拉取联网榜，更新面板排名为联网排名） */
+    cloudSubmit(rec, ranking).then(function(){
+      return cloudFetch();
+    }).then(function(entries){
+      if(!entries) return;
+      cloudCache = { entries: entries, at: Date.now() };
+      var rank = null;
+      entries.forEach(function(e, i){ if(e.player_id === rec.player_id) rank = i + 1; });
+      var posEl = $("lbResPos");
+      if(posEl && !$("lbResultModal").classList.contains("hidden")){
+        posEl.textContent = rank ? ("第 " + rank + " 名") : "—";
+        var stEl = $("lbResState");
+        if(stEl) stEl.textContent = "✓ 已记入联网风云榜";
+      }
+    }).catch(function(){});
     return Promise.resolve(r);
   }
 
@@ -6604,13 +6720,22 @@ window.__JYQT_STORY_OK = (function(){
       list.appendChild(row);
     });
   }
-  function refreshBoard(){
+  function renderLocalBoard(){
     var entries = localEntries();
     var latest = board.updatedAt || "";
     entries.forEach(function(e){ if(String(e.achieved_at || "") > String(latest)) latest = e.achieved_at; });
-    setStatus("🏆 风云榜群英荟萃：馆内高手与你的最佳成绩同台竞技——冲进前三，赢下「吉羊传奇」！", true);
+    setStatus("🏆 风云榜（本地模拟）：未联网，显示馆内高手与你的最佳成绩——联网后可见所有玩家。", true);
     renderBoardData(entries, entries.length, latest);
-    return Promise.resolve();
+  }
+  function refreshBoard(){
+    /* v36: 先同步渲染本地榜（立即有内容），再异步拉取联网榜覆盖；拉取失败则保留本地榜 */
+    renderLocalBoard();
+    return cloudFetch().then(function(entries){
+      if(!entries) return;
+      cloudCache = { entries: entries, at: Date.now() };
+      setStatus("🌐 联网风云榜：与所有玩家同台竞技——冲进前三，赢下「吉羊传奇」！", true);
+      renderBoardData(entries, entries.length, new Date().toISOString());
+    }).catch(function(){});
   }
   function myMetrics(rank, entry){
     var hist = board.myHistory;
@@ -6625,9 +6750,13 @@ window.__JYQT_STORY_OK = (function(){
     $("lbMyAva").innerHTML = avaHTML(player.avatar, true);
     $("lbMyName").textContent = player.nickname || "未命名小游客";
     $("lbMySub").textContent = "头像 · " + (AVATARS[player.avatar] ? AVATARS[player.avatar].n : "小福羊") + " ｜ 玩家 ID " + player.player_id.slice(0, 8) + "…（同名玩家靠 ID 区分）";
-    var entries = localEntries();
+    var entries = currentEntries();
     var myEntry = null, myRank = null;
     entries.forEach(function(e, i){ if(e.player_id === player.player_id){ myEntry = e; myRank = i + 1; } });
+    if(!myEntry){
+      var le = localEntries();
+      le.forEach(function(e, i){ if(e.player_id === player.player_id){ myEntry = e; myRank = i + 1; } });
+    }
     var hist = board.myHistory.slice().sort(function(a, b){ return String(b.created_at).localeCompare(String(a.created_at)); });
     var has = !!(myEntry || hist.length);
     $("lbMyEmpty").hidden = has;
